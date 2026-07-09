@@ -14,9 +14,8 @@ from common.paths import NERON_SERVER_DIR
 from memory.oblivia import (
     MemoryQuery,
     MemoryRecord,
-    ObliviaMemoryManager,
 )
-from server.common.registry.client import RegistryClient
+from memory.oblivia.manager import ObliviaMemoryManager
 
 
 logger = logging.getLogger("memory.app")

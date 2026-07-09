@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from memory.oblivia.text_utils import clean_value, normalize_text
+from memory.text_utils import clean_value, normalize_text
 
 
 @dataclass

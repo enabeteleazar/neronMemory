@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .schemas import KnowledgeFact, MemoryRecord, now_iso
-from .text_utils import normalize_text
+from memory.text_utils import normalize_text
 
 
 class SQLiteMemoryAdapter:

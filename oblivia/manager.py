@@ -6,7 +6,7 @@ from memory.semantic_memory import SemanticMemory
 
 from .schemas import MemoryQuery, MemoryRecord, MemorySearchResult, MemoryStatus
 from .sqlite_adapter import SQLiteMemoryAdapter
-from .text_utils import normalize_text
+from memory.text_utils import normalize_text
 
 
 class ObliviaMemoryManager:

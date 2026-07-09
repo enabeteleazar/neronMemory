@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from memory.oblivia.text_utils import normalize_text
+from memory.text_utils import normalize_text
 
 
 class SemanticQueryEngine:
