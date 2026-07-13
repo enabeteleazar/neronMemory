@@ -11,6 +11,7 @@ from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from common.paths import NERON_SERVER_DIR
+from server.common.registry.client import RegistryClient
 from memory.oblivia import (
     MemoryQuery,
     MemoryRecord,

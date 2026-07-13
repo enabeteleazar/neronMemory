@@ -15,7 +15,7 @@ class ObliviaMemoryManager:
         sqlite_path: str | None = None,
         obsidian_path: str | None = None,
     ) -> None:
-        self.sqlite = SQLiteMemoryAdapter(sqlite_path or "server/memory/neron_memory.db")
+        self.sqlite = SQLiteMemoryAdapter(sqlite_path or "memory/neron_memory.db")
         self.obsidian_path = Path(obsidian_path or "server/memory/obsidian")
         self.obsidian_path.mkdir(parents=True, exist_ok=True)
         self.semantic = SemanticMemory(self.sqlite)
