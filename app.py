@@ -13,11 +13,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from common.paths import NERON_SERVER_DIR
 from server.common.registry.client import RegistryClient
+from memory.knowledge import (
+    KnowledgeDocument,
+    KnowledgeDocumentMeta,
+    ObsidianKnowledgeProvider,
+)
 from memory.oblivia import (
     MemoryQuery,
     MemoryRecord,
 )
 from memory.oblivia.manager import ObliviaMemoryManager
+from memory.protocols import KnowledgeProvider, MemoryProvider
 
 
 logger = logging.getLogger("memory.app")
@@ -63,6 +69,10 @@ class MemoryService:
             sqlite_path=str(sqlite_path),
             obsidian_path=str(obsidian_path),
         )
+        assert isinstance(self.oblivia, MemoryProvider), (
+            "ObliviaMemoryManager ne satisfait plus le protocole MemoryProvider "
+            "(cf. server/memory/protocols.py) — vérifier les méthodes requises."
+        )
 
     async def remember(self, request: RememberRequest) -> dict[str, Any]:
         record = MemoryRecord(
@@ -94,6 +104,42 @@ def create_memory_service() -> MemoryService:
     return MemoryService(SQLITE_PATH, OBSIDIAN_PATH)
 
 
+class KnowledgeService:
+    """HTTP facade over a KnowledgeProvider (Obsidian aujourd'hui).
+
+    Volontairement une classe distincte de MemoryService, jamais fusionnée :
+    un document consulté n'est pas un souvenir personnel (cf.
+    server/memory/protocols.py).
+    """
+
+    def __init__(self, provider: KnowledgeProvider) -> None:
+        self.provider = provider
+
+    async def query(self, text: str, limit: int) -> list[dict[str, Any]]:
+        docs: list[KnowledgeDocument] = await asyncio.to_thread(
+            self.provider.query, text, limit
+        )
+        return [doc.model_dump(mode="json") for doc in docs]
+
+    async def list_documents(self) -> list[dict[str, Any]]:
+        docs: list[KnowledgeDocumentMeta] = await asyncio.to_thread(
+            self.provider.list_documents
+        )
+        return [doc.model_dump(mode="json") for doc in docs]
+
+    async def status(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.provider.status)
+
+
+def create_knowledge_provider() -> KnowledgeProvider:
+    provider = ObsidianKnowledgeProvider(OBSIDIAN_PATH)
+    assert isinstance(provider, KnowledgeProvider), (
+        "ObsidianKnowledgeProvider ne satisfait plus le protocole "
+        "KnowledgeProvider (cf. server/memory/protocols.py)."
+    )
+    return provider
+
+
 def create_registry_client() -> RegistryClient:
     return RegistryClient(
         service_name="memory",
@@ -112,6 +158,7 @@ def create_registry_client() -> RegistryClient:
 async def lifespan(app: FastAPI):
     app.state.started_at = time.monotonic()
     app.state.memory_service = create_memory_service()
+    app.state.knowledge_service = KnowledgeService(create_knowledge_provider())
     registry_client = create_registry_client()
     app.state.registry_client = registry_client
     await registry_client.start()
@@ -132,6 +179,10 @@ app = FastAPI(
 
 def _service(request: Request) -> MemoryService:
     return request.app.state.memory_service
+
+
+def _knowledge(request: Request) -> KnowledgeService:
+    return request.app.state.knowledge_service
 
 
 @app.get("/health")
@@ -185,3 +236,34 @@ async def search(
 ) -> dict[str, Any]:
     results = await _service(request).search(q, limit)
     return {"count": len(results), "results": results}
+
+
+# ── Knowledge Providers — distinct des souvenirs personnels ─────────────────
+# Cf. server/memory/protocols.py : un document Obsidian consulté n'est pas
+# un souvenir. Endpoints séparés de /memory/* volontairement, pour ne pas
+# recréer le mélange qu'on cherche justement à éviter.
+
+@app.get("/knowledge/health")
+async def knowledge_health(request: Request) -> dict[str, Any]:
+    status = await _knowledge(request).status()
+    return {
+        "service": "knowledge",
+        "status": "healthy" if status.get("ok") else "degraded",
+        **status,
+    }
+
+
+@app.get("/knowledge/query")
+async def knowledge_query(
+    request: Request,
+    q: str = Query(min_length=1),
+    limit: int = Query(default=10, ge=1, le=50),
+) -> dict[str, Any]:
+    results = await _knowledge(request).query(q, limit)
+    return {"count": len(results), "results": results}
+
+
+@app.get("/knowledge/documents")
+async def knowledge_documents(request: Request) -> dict[str, Any]:
+    docs = await _knowledge(request).list_documents()
+    return {"count": len(docs), "documents": docs}

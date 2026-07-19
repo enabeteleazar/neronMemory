@@ -1,20 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from memory.dumpable import Dumpable
+
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat()
-
-
-@dataclass
-class Dumpable:
-    def model_dump(self, mode: str | None = None) -> dict[str, Any]:
-        del mode
-        return asdict(self)
 
 
 @dataclass
