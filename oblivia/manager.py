@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from memory.protocols import StorageProvider
 from memory.semantic_memory import SemanticMemory
 
 from .schemas import MemoryQuery, MemoryRecord, MemorySearchResult, MemoryStatus
@@ -16,6 +17,10 @@ class ObliviaMemoryManager:
         obsidian_path: str | None = None,
     ) -> None:
         self.sqlite = SQLiteMemoryAdapter(sqlite_path or "memory/neron_memory.db")
+        assert isinstance(self.sqlite, StorageProvider), (
+            "SQLiteMemoryAdapter ne satisfait plus le protocole StorageProvider "
+            "(cf. server/memory/protocols.py) — vérifier les méthodes requises."
+        )
         self.obsidian_path = Path(obsidian_path or "server/memory/obsidian")
         self.obsidian_path.mkdir(parents=True, exist_ok=True)
         self.semantic = SemanticMemory(self.sqlite)
@@ -26,8 +31,6 @@ class ObliviaMemoryManager:
         record.metadata["facts"] = [fact.model_dump(mode="json") for fact in facts]
         record.metadata["semantic_facts_added"] = added
         record.metadata["natural_response"] = self._natural_remember_response(record, facts)
-        if facts and added == 0:
-            return record
         return self.sqlite.save_record(record)
 
     def recall(self, query: MemoryQuery) -> list[MemorySearchResult]:
@@ -61,7 +64,10 @@ class ObliviaMemoryManager:
         return {"deleted": 0}
 
     def status(self) -> MemoryStatus:
-        status = self.sqlite.status()
+        try:
+            status = self.sqlite.status()
+        except Exception as exc:
+            return MemoryStatus(ok=False, records=0, facts=0, error=str(exc))
         return MemoryStatus(ok=True, records=status["records"], facts=status["facts"])
 
     def _natural_remember_response(self, record: MemoryRecord, facts) -> str:
