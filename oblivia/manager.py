@@ -26,8 +26,6 @@ class ObliviaMemoryManager:
         record.metadata["facts"] = [fact.model_dump(mode="json") for fact in facts]
         record.metadata["semantic_facts_added"] = added
         record.metadata["natural_response"] = self._natural_remember_response(record, facts)
-        if facts and added == 0:
-            return record
         return self.sqlite.save_record(record)
 
     def recall(self, query: MemoryQuery) -> list[MemorySearchResult]:
@@ -61,7 +59,10 @@ class ObliviaMemoryManager:
         return {"deleted": 0}
 
     def status(self) -> MemoryStatus:
-        status = self.sqlite.status()
+        try:
+            status = self.sqlite.status()
+        except Exception as exc:
+            return MemoryStatus(ok=False, records=0, facts=0, error=str(exc))
         return MemoryStatus(ok=True, records=status["records"], facts=status["facts"])
 
     def _natural_remember_response(self, record: MemoryRecord, facts) -> str:

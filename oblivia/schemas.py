@@ -64,3 +64,4 @@ class MemoryStatus(Dumpable):
     ok: bool
     records: int
     facts: int = 0
+    error: str | None = None

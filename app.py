@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
@@ -63,24 +64,30 @@ class MemoryService:
             obsidian_path=str(obsidian_path),
         )
 
-    def remember(self, request: RememberRequest) -> dict[str, Any]:
+    async def remember(self, request: RememberRequest) -> dict[str, Any]:
         record = MemoryRecord(
             content=request.content,
             category=request.category,
             metadata=request.metadata,
         )
-        return self.oblivia.remember(record).model_dump(mode="json")
+        result = await asyncio.to_thread(self.oblivia.remember, record)
+        return result.model_dump(mode="json")
 
-    def search(self, query: str, limit: int) -> list[dict[str, Any]]:
-        return [
-            result.model_dump(mode="json")
-            for result in self.oblivia.recall(
-                MemoryQuery(query=query, limit=limit)
-            )
-        ]
+    async def search(self, query: str, limit: int) -> list[dict[str, Any]]:
+        results = await asyncio.to_thread(
+            self.oblivia.recall, MemoryQuery(query=query, limit=limit)
+        )
+        return [result.model_dump(mode="json") for result in results]
 
-    def status(self) -> dict[str, Any]:
-        return self.oblivia.status().model_dump(mode="json")
+    async def status(self) -> dict[str, Any]:
+        result = await asyncio.to_thread(self.oblivia.status)
+        return result.model_dump(mode="json")
+
+    async def recall_knowledge(self, query: str, limit: int) -> dict[str, Any]:
+        return await asyncio.to_thread(self.oblivia.recall_knowledge, query, limit)
+
+    async def forget(self, query: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self.oblivia.forget, query)
 
 
 def create_memory_service() -> MemoryService:
@@ -91,7 +98,10 @@ def create_registry_client() -> RegistryClient:
     return RegistryClient(
         service_name="memory",
         version=VERSION,
-        host="localhost",
+        # Défauts alignés sur neron.server.yaml (nodes.memory). Peuvent être
+        # surchargés par NERON_SERVICE_HOST/PORT (cf. service_from_env) —
+        # mais ne doivent pas en dépendre pour être corrects par eux-mêmes.
+        host="127.0.1.4",
         port=8040,
         capabilities=["memory", "sqlite", "obsidian", "context_storage"],
         metadata={},
@@ -126,7 +136,7 @@ def _service(request: Request) -> MemoryService:
 
 @app.get("/health")
 async def health(request: Request) -> dict[str, str]:
-    status = _service(request).status()
+    status = await _service(request).status()
     return {
         "service": "memory",
         "status": "healthy" if status["ok"] else "degraded",
@@ -141,22 +151,20 @@ async def service_status(request: Request) -> dict[str, Any]:
         "status": "running",
         "uptime": round(max(0.0, time.monotonic() - started_at), 3),
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "backends": _service(request).status(),
+        "backends": await _service(request).status(),
     }
 
 
 @app.post("/memory/remember")
 async def remember(request: Request, payload: RememberRequest) -> dict[str, Any]:
-    return {"memory": _service(request).remember(payload)}
+    return {"memory": await _service(request).remember(payload)}
 
 
 @app.post("/memory/recall")
 async def recall(request: Request, payload: RecallRequest) -> dict[str, Any]:
-    results = _service(request).search(payload.query, payload.limit)
-    knowledge = _service(request).oblivia.recall_knowledge(
-        payload.query,
-        limit=payload.limit,
-    )
+    service = _service(request)
+    results = await service.search(payload.query, payload.limit)
+    knowledge = await service.recall_knowledge(payload.query, payload.limit)
     return {
         "count": len(results),
         "results": results,
@@ -166,7 +174,7 @@ async def recall(request: Request, payload: RecallRequest) -> dict[str, Any]:
 
 @app.post("/memory/forget")
 async def forget(request: Request, payload: ForgetRequest) -> dict[str, Any]:
-    return _service(request).oblivia.forget(payload.query)
+    return await _service(request).forget(payload.query)
 
 
 @app.get("/memory/search")
@@ -175,5 +183,5 @@ async def search(
     q: str = Query(min_length=1),
     limit: int = Query(default=10, ge=1, le=100),
 ) -> dict[str, Any]:
-    results = _service(request).search(q, limit)
+    results = await _service(request).search(q, limit)
     return {"count": len(results), "results": results}
