@@ -102,7 +102,13 @@ class SemanticQueryEngine:
 
     def _generic_answer(self, q: str, facts) -> str | None:
         relation = None
-        for prefix in ("quel est mon ", "quelle est ma ", "quelle est mon ", "quel est ma ", "ou est ma ", "ou est mon ", "de quelle couleur est mon ", "de quelle couleur est ma "):
+        # Note : "comment s appelle mon/ma X" ajouté le 19 juillet 2026,
+        # symétrique du repli "X s'appelle Y" ajouté côté FactExtractor le
+        # même jour — sans lui, un fait extrait via ce nouveau repli
+        # d'extraction (ex. "voiture" -> "Nébula") n'avait aucune façon
+        # d'être retrouvé au recall : "Comment s'appelle ma voiture ?" ne
+        # matchait aucun préfixe existant ici.
+        for prefix in ("quel est mon ", "quelle est ma ", "quelle est mon ", "quel est ma ", "ou est ma ", "ou est mon ", "de quelle couleur est mon ", "de quelle couleur est ma ", "comment s appelle mon ", "comment s appelle ma "):
             if q.startswith(prefix):
                 relation = q.removeprefix(prefix).strip().replace(" ", "_")
                 break

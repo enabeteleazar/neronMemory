@@ -93,6 +93,19 @@ class FactExtractor:
                 ]
             return [ExtractedFact("user", self._object_relation(item), obj, metadata={"label": item})]
 
+        # Repli générique pour "mon/ma/mes X s'appelle(nt) Y" — symétrique du
+        # repli "est/sont" ci-dessus. Sans lui, seuls trois sujets câblés en
+        # dur (femme/fils/chien, cf. `patterns` plus haut) étaient reconnus ;
+        # "Ma voiture s'appelle Nébula" ou "Mon projet s'appelle X" ne
+        # produisaient AUCUN fait — le texte brut était bien stocké (record),
+        # mais rien d'interrogeable au recall. Bug trouvé le 19 juillet 2026.
+        possessive_named = re.match(r"(mon|ma|mes)\s+(.+?)\s+s'appelle(?:nt)?\s+(.+)$", value)
+        if possessive_named:
+            item = clean_value(possessive_named.group(2))
+            name_match = re.search(r"s['’]appelle(?:nt)?\s+(.+)$", original, re.IGNORECASE)
+            obj = clean_value(name_match.group(1)) if name_match else clean_value(possessive_named.group(3))
+            return [ExtractedFact("user", self._object_relation(item), obj, metadata={"label": item})]
+
         return facts
 
     def _strip_directive(self, text: str) -> str:
