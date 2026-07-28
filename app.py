@@ -14,6 +14,7 @@ import httpx
 from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from common.metrics import mount_metrics
 from common.paths import NERON_SERVER_DIR, service_version
 from server.common.registry.client import RegistryClient
 from memory.knowledge import (
@@ -252,6 +253,8 @@ app = FastAPI(
     version=VERSION,
     lifespan=lifespan,
 )
+
+mount_metrics(app, "memory")
 
 
 def _service(request: Request) -> MemoryService:
