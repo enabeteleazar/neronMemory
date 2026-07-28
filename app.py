@@ -8,10 +8,13 @@ from pathlib import Path
 import time
 from typing import Any
 
+import os
+
+import httpx
 from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from common.paths import NERON_SERVER_DIR
+from common.paths import NERON_SERVER_DIR, service_version
 from server.common.registry.client import RegistryClient
 from memory.knowledge import (
     KnowledgeDocument,
@@ -27,10 +30,24 @@ from memory.protocols import KnowledgeProvider, MemoryProvider
 
 
 logger = logging.getLogger("memory.app")
-VERSION = "0.1.0"
+VERSION = service_version(__file__)
 MEMORY_ROOT = NERON_SERVER_DIR / "memory"
 SQLITE_PATH = MEMORY_ROOT / "neron_memory.db"
 OBSIDIAN_PATH = MEMORY_ROOT / "obsidian"
+
+NERON_LLM_URL = os.getenv("NERON_LLM_URL", "http://127.0.1.2:8765")
+NERON_API_KEY = os.getenv("NERON_API_KEY", "")
+_observe_tasks: set[asyncio.Task] = set()
+_OBSERVE_PROMPT_TEMPLATE = (
+    'Message : "{text}"\n\n'
+    "Liste chaque detail factuel nomme et durable sur l'utilisateur ou son "
+    "entourage present dans ce message (prenom d'une personne, gout, "
+    "preference, situation personnelle) - IGNORE les activites "
+    "ponctuelles/ephemeres. Reponds EXACTEMENT selon ce format, une ligne "
+    "par fait trouve, rien d'autre avant/apres/entre :\n"
+    "FAIT: <detail en quelques mots>\n"
+    "Si aucun detail durable, reponds uniquement : NON"
+)
 
 
 class RememberRequest(BaseModel):
@@ -59,6 +76,12 @@ class ForgetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     query: str = Field(min_length=1)
+
+
+class ObserveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    text: str = Field(min_length=1)
 
 
 class MemoryService:
@@ -98,6 +121,60 @@ class MemoryService:
 
     async def forget(self, query: str) -> dict[str, Any]:
         return await asyncio.to_thread(self.oblivia.forget, query)
+
+    async def observe(self, text: str) -> dict[str, Any]:
+        """Oblivia recoit un texte brut de conversation et decide seule quoi
+        en retenir. Repond immediatement (le jugement LLM est lance en tache
+        de fond ICI, cote memory) pour ne jamais faire attendre l'appelant
+        pendant toute la duree de la generation (cf. ADR-0001)."""
+        task = asyncio.create_task(self._observe_background(text))
+        _observe_tasks.add(task)
+        task.add_done_callback(_observe_tasks.discard)
+        return {"observed": True, "status": "scheduled"}
+
+    async def _observe_background(self, text: str) -> None:
+        logger.warning("DEBUG_observe_background_started text=%r", text)
+        prompt = _OBSERVE_PROMPT_TEMPLATE.format(text=text)
+        headers = {"Authorization": f"Bearer {NERON_API_KEY}"} if NERON_API_KEY else {}
+        try:
+            async with httpx.AsyncClient(timeout=250.0) as client:
+                response = await client.post(
+                    f"{NERON_LLM_URL}/llm/generate",
+                    json={
+                        "task_type": "chat",
+                        "prompt": prompt,
+                        "context": {},
+                        "model_preference": "auto",
+                    },
+                    headers=headers,
+                )
+            response.raise_for_status()
+            data = response.json()
+            logger.warning("DEBUG_observe_llm_call_succeeded")
+        except Exception:
+            logger.warning("oblivia_observe_judge_failed", exc_info=True)
+            return
+
+        raw_text = str(data.get("result") or "").strip()
+        logger.info("oblivia_observe_judge_result text=%r", raw_text)
+
+        facts: list[str] = []
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if line.upper().startswith("FAIT:"):
+                fact_text = line.split(":", 1)[1].strip() if ":" in line else ""
+                if fact_text:
+                    facts.append(fact_text)
+        facts = facts[:5]
+
+        for fact_text in facts:
+            record = MemoryRecord(
+                content=fact_text,
+                category="auto",
+                metadata={"source": "oblivia_auto_judge"},
+            )
+            await asyncio.to_thread(self.oblivia.remember, record)
+        logger.info("oblivia_observe_done facts_saved=%d", len(facts))
 
 
 def create_memory_service() -> MemoryService:
@@ -226,6 +303,11 @@ async def recall(request: Request, payload: RecallRequest) -> dict[str, Any]:
 @app.post("/memory/forget")
 async def forget(request: Request, payload: ForgetRequest) -> dict[str, Any]:
     return await _service(request).forget(payload.query)
+
+
+@app.post("/memory/observe")
+async def observe(request: Request, payload: ObserveRequest) -> dict[str, Any]:
+    return await _service(request).observe(payload.text)
 
 
 @app.get("/memory/search")
