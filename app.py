@@ -30,23 +30,27 @@ from memory.protocols import KnowledgeProvider, MemoryProvider
 
 
 logger = logging.getLogger("memory.app")
+logging.basicConfig(level=logging.INFO)
 VERSION = service_version(__file__)
 MEMORY_ROOT = NERON_SERVER_DIR / "memory"
 SQLITE_PATH = MEMORY_ROOT / "neron_memory.db"
 OBSIDIAN_PATH = MEMORY_ROOT / "obsidian"
 
 NERON_LLM_URL = os.getenv("NERON_LLM_URL", "http://127.0.1.2:8765")
+# serve.py exporte NERON_LLM_URL AVEC le suffixe /llm, mais le defaut
+# ci-dessus ne l a pas : on normalise pour accepter les deux formes.
+LLM_GENERATE_URL = NERON_LLM_URL.rstrip("/").removesuffix("/llm") + "/llm/generate"
 NERON_API_KEY = os.getenv("NERON_API_KEY", "")
 _observe_tasks: set[asyncio.Task] = set()
 _OBSERVE_PROMPT_TEMPLATE = (
     'Message : "{text}"\n\n'
-    "Liste chaque detail factuel nomme et durable sur l'utilisateur ou son "
-    "entourage present dans ce message (prenom d'une personne, gout, "
-    "preference, situation personnelle) - IGNORE les activites "
-    "ponctuelles/ephemeres. Reponds EXACTEMENT selon ce format, une ligne "
-    "par fait trouve, rien d'autre avant/apres/entre :\n"
-    "FAIT: <detail en quelques mots>\n"
-    "Si aucun detail durable, reponds uniquement : NON"
+    "Liste chaque information durable sur l'utilisateur ou son entourage "
+    "(prenom, lien de parente, gout, situation personnelle) presente dans ce "
+    "message - IGNORE les activites ponctuelles. Reponds EXACTEMENT selon ce "
+    "format, une ligne par information, rien d'autre avant/apres/entre :\n"
+    "FAIT: <phrase complete a la troisieme personne>\n"
+    "Exemple : FAIT: Le chien de l'utilisateur s'appelle Rex.\n"
+    "Si aucune information durable, reponds uniquement : NON"
 )
 
 
@@ -139,7 +143,7 @@ class MemoryService:
         try:
             async with httpx.AsyncClient(timeout=250.0) as client:
                 response = await client.post(
-                    f"{NERON_LLM_URL}/llm/generate",
+                    LLM_GENERATE_URL,
                     json={
                         "task_type": "chat",
                         "prompt": prompt,
