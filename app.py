@@ -14,9 +14,8 @@ import httpx
 from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from common.metrics import mount_metrics
-from common.paths import NERON_SERVER_DIR, service_version
-from server.common.registry.client import RegistryClient
+from server.common.paths import NERON_SERVER_DIR, service_version
+from server.common.service import create_service_app
 from memory.knowledge import (
     KnowledgeDocument,
     KnowledgeDocumentMeta,
@@ -218,43 +217,30 @@ def create_knowledge_provider() -> KnowledgeProvider:
     return provider
 
 
-def create_registry_client() -> RegistryClient:
-    return RegistryClient(
-        service_name="memory",
-        version=VERSION,
-        # Défauts alignés sur neron.server.yaml (nodes.memory). Peuvent être
-        # surchargés par NERON_SERVICE_HOST/PORT (cf. service_from_env) —
-        # mais ne doivent pas en dépendre pour être corrects par eux-mêmes.
-        host="127.0.1.4",
-        port=8040,
-        capabilities=["memory", "sqlite", "obsidian", "context_storage"],
-        metadata={},
-    )
-
-
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    app.state.started_at = time.monotonic()
+async def _setup(app: FastAPI):
     app.state.memory_service = create_memory_service()
     app.state.knowledge_service = KnowledgeService(create_knowledge_provider())
-    registry_client = create_registry_client()
-    app.state.registry_client = registry_client
-    await registry_client.start()
-    logger.info("Memory daemon started on port 8040")
+    logger.info("Memory daemon started")
     try:
         yield
     finally:
-        await registry_client.stop()
         logger.info("Memory daemon stopped")
 
 
-app = FastAPI(
+async def _health_details(request: Request) -> dict[str, Any]:
+    status = await _service(request).status()
+    return {"status": "healthy" if status["ok"] else "degraded"}
+
+
+app = create_service_app(
+    name="memory",
     title="NéronOS Memory",
     version=VERSION,
-    lifespan=lifespan,
+    capabilities=["memory", "sqlite", "obsidian", "context_storage"],
+    setup=_setup,
+    health=_health_details,
 )
-
-mount_metrics(app, "memory")
 
 
 def _service(request: Request) -> MemoryService:
@@ -263,15 +249,6 @@ def _service(request: Request) -> MemoryService:
 
 def _knowledge(request: Request) -> KnowledgeService:
     return request.app.state.knowledge_service
-
-
-@app.get("/health")
-async def health(request: Request) -> dict[str, str]:
-    status = await _service(request).status()
-    return {
-        "service": "memory",
-        "status": "healthy" if status["ok"] else "degraded",
-    }
 
 
 @app.get("/status")
