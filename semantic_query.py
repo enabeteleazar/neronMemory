@@ -3,6 +3,27 @@ from __future__ import annotations
 from memory.text_utils import normalize_text
 
 
+# Le vocabulaire ferme du juge memoire est en francais, le moteur de lecture
+# historique interroge des predicats anglais. Un nom logique couvre donc les
+# DEUX orthographes : les anciennes fiches restent lisibles, les nouvelles le
+# deviennent, et aucun site d appel ne change.
+EQUIVALENTS = {
+    "name": {"name", "prenom"},
+    "lives_at": {"lives_at", "habite_a"},
+    "works_at": {"works_at", "travaille_a"},
+    "spouse": {"spouse", "a_pour_conjoint"},
+    "has_child": {"has_child", "a_pour_enfant"},
+    "likes": {"likes", "aime"},
+    "owns": {"owns", "possede"},
+}
+
+SUJETS_UTILISATEUR = {"user", "utilisateur"}
+
+
+def equiv(nom: str) -> set[str]:
+    return EQUIVALENTS.get(nom, {nom})
+
+
 class SemanticQueryEngine:
     def __init__(self, adapter) -> None:
         self.adapter = adapter
@@ -22,16 +43,16 @@ class SemanticQueryEngine:
         if "couleur preferee" in q:
             return [f for f in facts if f.predicate == "favorite_color"]
         if "femme" in q or "epouse" in q:
-            return [f for f in facts if f.predicate == "spouse" and f.is_current]
+            return [f for f in facts if f.predicate in equiv("spouse") and f.is_current]
         if "travaille" in q or "travail" in q:
-            return [f for f in facts if f.predicate == "works_at"]
+            return [f for f in facts if f.predicate in equiv("works_at")]
         if "habite" in q or "vecu" in q:
-            return [f for f in facts if f.predicate == "lives_at"]
+            return [f for f in facts if f.predicate in equiv("lives_at")]
         return facts
 
     def _answer(self, q: str, facts) -> str | None:
-        current = lambda p: [f for f in facts if f.predicate == p and f.is_current and not f.retracted]
-        all_valid = lambda p: [f for f in facts if f.predicate == p and not f.retracted]
+        current = lambda p: [f for f in facts if f.predicate in equiv(p) and f.is_current and not f.retracted]
+        all_valid = lambda p: [f for f in facts if f.predicate in equiv(p) and not f.retracted]
 
         if q in {"qui suis je", "parle moi de moi", "presente moi", "que sais tu de moi", "fais un resume de ce que tu sais sur moi"}:
             return self._profile(facts)
@@ -126,7 +147,13 @@ class SemanticQueryEngine:
 
     def _profile(self, facts) -> str:
         parts: list[str] = []
-        by_pred = lambda p: [f for f in facts if f.predicate == p and f.is_current and not f.retracted]
+        # Le profil ne parle que de l utilisateur : sans ce filtre, un fait sur
+        # un tiers ("Julien travaille a Bordeaux") serait raconte comme le sien.
+        by_pred = lambda p: [
+            f for f in facts
+            if f.predicate in equiv(p) and f.is_current and not f.retracted
+            and normalize_text(f.subject) in SUJETS_UTILISATEUR
+        ]
         if name := self._last(by_pred("name")):
             parts.append(f"Tu t'appelles {name.object}.")
         if home := self._last(by_pred("lives_at")):
@@ -141,6 +168,21 @@ class SemanticQueryEngine:
         likes = [f.object for f in by_pred("likes")]
         if likes:
             parts.append(f"Tu aimes {self._join(likes)}.")
+        aversions = [f.object for f in by_pred("n_aime_pas")]
+        if aversions:
+            parts.append(f"Tu n'aimes pas {self._join(aversions)}.")
+        freres = [f.object for f in by_pred("a_pour_frere")]
+        if freres:
+            parts.append(
+                f"Ton frère s'appelle {self._join(freres)}." if len(freres) == 1
+                else f"Tes frères s'appellent {self._join(freres)}."
+            )
+        soeurs = [f.object for f in by_pred("a_pour_soeur")]
+        if soeurs:
+            parts.append(
+                f"Ta sœur s'appelle {self._join(soeurs)}." if len(soeurs) == 1
+                else f"Tes sœurs s'appellent {self._join(soeurs)}."
+            )
         return " ".join(parts) if parts else "Je connais encore peu d’informations sur toi."
 
     def _last(self, values):
