@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import logging
+import re
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -63,6 +64,16 @@ _OBSERVE_PROMPT_TEMPLATE = (
     "Reponds en JSON, cle facts, liste d objets ayant les cles subject, "
     "predicate, object.\n\n"
     "Message : {text}"
+)
+
+
+# Voie rapide : un ordre explicite de memorisation vaut corroboration
+# immediate. Le fait passe quand meme par le brouillon (tracabilite), mais
+# avec assez de points pour etre promu dans la foulee.
+_ORDRE_EXPLICITE = re.compile(
+    r"\b(retiens|retenir|souviens[- ]toi|rappelle[- ]toi|memorise|"
+    r"note que|n[' ]oublie pas)\b",
+    re.IGNORECASE,
 )
 
 
@@ -158,12 +169,19 @@ class MemoryService:
         )
         await asyncio.to_thread(self.oblivia.sqlite.save_record, brut)
         logger.info("oblivia_observe_brut_saved id=%s source=%s", brut.id, source)
-        task = asyncio.create_task(self._observe_background(text, brut.id))
+        explicite = source == "utilisateur" and bool(_ORDRE_EXPLICITE.search(text))
+        if explicite:
+            logger.info("oblivia_voie_rapide id=%s", brut.id)
+        task = asyncio.create_task(
+            self._observe_background(text, brut.id, explicite)
+        )
         _observe_tasks.add(task)
         task.add_done_callback(_observe_tasks.discard)
         return {"observed": True, "status": "scheduled", "record_id": brut.id}
 
-    async def _observe_background(self, text: str, origin_id: str | None = None) -> None:
+    async def _observe_background(
+        self, text: str, origin_id: str | None = None, explicite: bool = False
+    ) -> None:
         logger.debug("DEBUG_observe_background_started text=%r", text)
         prompt = _OBSERVE_PROMPT_TEMPLATE.format(text=text)
         headers = {"Authorization": f"Bearer {NERON_API_KEY}"} if NERON_API_KEY else {}
@@ -206,10 +224,11 @@ class MemoryService:
 
         maintenant = datetime.now(timezone.utc).isoformat()
         cle = origin_id or maintenant
+        points = 2.0 if explicite else 1.0
         for f in retenus:
             etat = await asyncio.to_thread(
                 self.oblivia.sqlite.add_candidate,
-                f["subject"], f["predicate"], f["object"], cle, 1.0, maintenant,
+                f["subject"], f["predicate"], f["object"], cle, points, maintenant,
             )
             logger.info(
                 "oblivia_candidat %s | %s | %s -> %s point(s)%s",
