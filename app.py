@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Literal
 
 import os
 
@@ -82,10 +82,16 @@ class ForgetRequest(BaseModel):
     query: str = Field(min_length=1)
 
 
+# Vocabulaire ferme de provenance. Toute valeur hors liste est rejetee par
+# l'API : la provenance est posee par le code appelant, jamais deduite.
+SourceProvenance = Literal["utilisateur", "agent", "externe", "systeme", "inconnu"]
+
+
 class ObserveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     text: str = Field(min_length=1)
+    source: SourceProvenance = "inconnu"
 
 
 class MemoryService:
@@ -126,26 +132,35 @@ class MemoryService:
     async def forget(self, query: str) -> dict[str, Any]:
         return await asyncio.to_thread(self.oblivia.forget, query)
 
-    async def observe(self, text: str) -> dict[str, Any]:
-        """Oblivia recoit un texte brut de conversation et decide seule quoi
-        en retenir. Repond immediatement (le jugement LLM est lance en tache
-        de fond ICI, cote memory) pour ne jamais faire attendre l'appelant
-        pendant toute la duree de la generation (cf. ADR-0001)."""
-        task = asyncio.create_task(self._observe_background(text))
+    async def observe(self, text: str, source: str = "inconnu") -> dict[str, Any]:
+        """Oblivia recoit un texte brut de conversation. Le texte est d'abord
+        ecrit TEL QUEL et de maniere SYNCHRONE dans memory_records : aucun
+        message ne doit pouvoir etre perdu, meme si le juge echoue ou
+        n'extrait rien. Le jugement LLM part ensuite en tache de fond
+        (cf. ADR-0001)."""
+        brut = MemoryRecord(
+            content=text,
+            source=source,
+            category="brut",
+            metadata={"origine": "observe"},
+        )
+        await asyncio.to_thread(self.oblivia.sqlite.save_record, brut)
+        logger.info("oblivia_observe_brut_saved id=%s source=%s", brut.id, source)
+        task = asyncio.create_task(self._observe_background(text, brut.id))
         _observe_tasks.add(task)
         task.add_done_callback(_observe_tasks.discard)
-        return {"observed": True, "status": "scheduled"}
+        return {"observed": True, "status": "scheduled", "record_id": brut.id}
 
-    async def _observe_background(self, text: str) -> None:
-        logger.warning("DEBUG_observe_background_started text=%r", text)
+    async def _observe_background(self, text: str, origin_id: str | None = None) -> None:
+        logger.debug("DEBUG_observe_background_started text=%r", text)
         prompt = _OBSERVE_PROMPT_TEMPLATE.format(text=text)
         headers = {"Authorization": f"Bearer {NERON_API_KEY}"} if NERON_API_KEY else {}
         try:
-            async with httpx.AsyncClient(timeout=250.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 response = await client.post(
                     LLM_GENERATE_URL,
                     json={
-                        "task_type": "chat",
+                        "task_type": "memory",
                         "prompt": prompt,
                         "context": {},
                         "model_preference": "auto",
@@ -154,7 +169,7 @@ class MemoryService:
                 )
             response.raise_for_status()
             data = response.json()
-            logger.warning("DEBUG_observe_llm_call_succeeded")
+            logger.debug("DEBUG_observe_llm_call_succeeded")
         except Exception:
             logger.warning("oblivia_observe_judge_failed", exc_info=True)
             return
@@ -169,13 +184,14 @@ class MemoryService:
                 fact_text = line.split(":", 1)[1].strip() if ":" in line else ""
                 if fact_text:
                     facts.append(fact_text)
-        facts = facts[:5]
+        facts = facts[:50]
 
         for fact_text in facts:
             record = MemoryRecord(
                 content=fact_text,
-                category="auto",
-                metadata={"source": "oblivia_auto_judge"},
+                source="agent",
+                category="extrait",
+                metadata={"juge": "oblivia_auto_judge", "origin_memory": origin_id},
             )
             await asyncio.to_thread(self.oblivia.remember, record)
         logger.info("oblivia_observe_done facts_saved=%d", len(facts))
@@ -291,7 +307,7 @@ async def forget(request: Request, payload: ForgetRequest) -> dict[str, Any]:
 
 @app.post("/memory/observe")
 async def observe(request: Request, payload: ObserveRequest) -> dict[str, Any]:
-    return await _service(request).observe(payload.text)
+    return await _service(request).observe(payload.text, payload.source)
 
 
 @app.get("/memory/search")
