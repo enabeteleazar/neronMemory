@@ -66,6 +66,14 @@ class SQLiteMemoryAdapter:
                     promoted_fact_id INTEGER,
                     UNIQUE(subject, predicate, object)
                 );
+                -- Journal des relectures : une ligne par passe sur un message.
+                CREATE TABLE IF NOT EXISTS reread_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id TEXT NOT NULL,
+                    passe INTEGER NOT NULL,
+                    done_at TEXT NOT NULL,
+                    UNIQUE(record_id, passe)
+                );
                 CREATE TABLE IF NOT EXISTS semantic_nodes (
                     id TEXT PRIMARY KEY,
                     type TEXT NOT NULL,
@@ -181,6 +189,29 @@ class SQLiteMemoryAdapter:
             promus.append({"subject": row["subject"], "predicate": row["predicate"],
                            "object": row["object"], "points": row["points"]})
         return promus
+
+    def records_to_reread(self, limit: int) -> list[dict[str, Any]]:
+        """Messages bruts de l utilisateur, les moins relus d abord."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT r.id AS rid, r.content AS contenu, "
+                "COALESCE((SELECT COUNT(*) FROM reread_log l "
+                "          WHERE l.record_id = r.id), 0) AS passes "
+                "FROM memory_records r "
+                "WHERE r.category = 'brut' AND r.source = 'utilisateur' "
+                "ORDER BY passes ASC, r.created_at ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [{"id": r["rid"], "content": r["contenu"], "passes": r["passes"]}
+                for r in rows]
+
+    def mark_reread(self, record_id: str, passe: int, timestamp: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO reread_log (record_id, passe, done_at) "
+                "VALUES (?, ?, ?)",
+                (record_id, passe, timestamp),
+            )
 
     def add_fact(self, fact: KnowledgeFact) -> bool:
         if fact.metadata.get("retract"):

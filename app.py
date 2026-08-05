@@ -110,6 +110,12 @@ class ForgetRequest(BaseModel):
 SourceProvenance = Literal["utilisateur", "agent", "externe", "systeme", "inconnu"]
 
 
+class RereadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    limit: int = Field(default=5, ge=1, le=50)
+
+
 class ObserveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -179,8 +185,36 @@ class MemoryService:
         task.add_done_callback(_observe_tasks.discard)
         return {"observed": True, "status": "scheduled", "record_id": brut.id}
 
+    async def reread(self, limit: int = 5) -> dict[str, Any]:
+        """Rejoue l extraction sur d anciens messages bruts.
+
+        Chaque passe vaut 0.5 point et porte une cle distincte (#rN) : sans
+        cela add_candidate la prendrait pour un doublon et l ignorerait.
+        """
+        records = await asyncio.to_thread(
+            self.oblivia.sqlite.records_to_reread, limit
+        )
+        for rec in records:
+            passe = rec["passes"] + 1
+            logger.info("oblivia_relecture id=%s passe=%d", rec["id"], passe)
+            await self._observe_background(
+                rec["content"], rec["id"],
+                points_forces=0.5, origin_suffixe=f"#r{passe}",
+            )
+            await asyncio.to_thread(
+                self.oblivia.sqlite.mark_reread, rec["id"], passe,
+                datetime.now(timezone.utc).isoformat(),
+            )
+        logger.info("oblivia_relecture_terminee relus=%d", len(records))
+        return {"relus": len(records)}
+
     async def _observe_background(
-        self, text: str, origin_id: str | None = None, explicite: bool = False
+        self,
+        text: str,
+        origin_id: str | None = None,
+        explicite: bool = False,
+        points_forces: float | None = None,
+        origin_suffixe: str = "",
     ) -> None:
         logger.debug("DEBUG_observe_background_started text=%r", text)
         prompt = _OBSERVE_PROMPT_TEMPLATE.format(text=text)
@@ -223,8 +257,11 @@ class MemoryService:
             logger.info("oblivia_rejet motif=%r triplet=%r", motif, triplet)
 
         maintenant = datetime.now(timezone.utc).isoformat()
-        cle = origin_id or maintenant
-        points = 2.0 if explicite else 1.0
+        cle = (origin_id or maintenant) + origin_suffixe
+        points = (
+            points_forces if points_forces is not None
+            else (2.0 if explicite else 1.0)
+        )
         for f in retenus:
             etat = await asyncio.to_thread(
                 self.oblivia.sqlite.add_candidate,
@@ -355,6 +392,11 @@ async def recall(request: Request, payload: RecallRequest) -> dict[str, Any]:
 @app.post("/memory/forget")
 async def forget(request: Request, payload: ForgetRequest) -> dict[str, Any]:
     return await _service(request).forget(payload.query)
+
+
+@app.post("/memory/reread")
+async def reread(request: Request, payload: RereadRequest) -> dict[str, Any]:
+    return await _service(request).reread(payload.limit)
 
 
 @app.post("/memory/observe")
