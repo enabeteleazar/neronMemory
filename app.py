@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 import time
@@ -26,6 +27,7 @@ from memory.oblivia import (
     MemoryRecord,
 )
 from memory.oblivia.manager import ObliviaMemoryManager
+from memory.oblivia.normalisation import VOCABULAIRE, normaliser
 from memory.protocols import KnowledgeProvider, MemoryProvider
 
 
@@ -42,15 +44,25 @@ NERON_LLM_URL = os.getenv("NERON_LLM_URL", "http://127.0.1.2:8765")
 LLM_GENERATE_URL = NERON_LLM_URL.rstrip("/").removesuffix("/llm") + "/llm/generate"
 NERON_API_KEY = os.getenv("NERON_API_KEY", "")
 _observe_tasks: set[asyncio.Task] = set()
+# Consigne v8, gagnante au banc du 03/08. La liste des predicats est
+# construite depuis VOCABULAIRE : une seule source, jamais deux listes.
 _OBSERVE_PROMPT_TEMPLATE = (
-    'Message : "{text}"\n\n'
-    "Liste chaque information durable sur l'utilisateur ou son entourage "
-    "(prenom, lien de parente, gout, situation personnelle) presente dans ce "
-    "message - IGNORE les activites ponctuelles. Reponds EXACTEMENT selon ce "
-    "format, une ligne par information, rien d'autre avant/apres/entre :\n"
-    "FAIT: <phrase complete a la troisieme personne>\n"
-    "Exemple : FAIT: Le chien de l'utilisateur s'appelle Rex.\n"
-    "Si aucune information durable, reponds uniquement : NON"
+    "Extrais les informations durables de ce message.\n\n"
+    "Beaucoup de messages ne contiennent AUCUNE information durable : ils "
+    "parlent d une activite ponctuelle, d un projet du soir, d un rendez-vous. "
+    "Dans ce cas la bonne reponse est une liste facts VIDE. C est une reponse "
+    "correcte et attendue, pas un echec.\n\n"
+    "Le predicat doit OBLIGATOIREMENT etre choisi dans cette liste :\n"
+    + ", ".join(sorted(VOCABULAIRE)) + "\n\n"
+    "Regles :\n"
+    "- un objet JSON par information ATOMIQUE : le metier et la ville sont "
+    "deux faits distincts\n"
+    "- le sujet est utilisateur, ou le prenom de la personne concernee\n"
+    "- l objet est une valeur courte, jamais une phrase\n"
+    "- n invente rien qui ne soit pas ecrit dans le message\n\n"
+    "Reponds en JSON, cle facts, liste d objets ayant les cles subject, "
+    "predicate, object.\n\n"
+    "Message : {text}"
 )
 
 
@@ -156,11 +168,12 @@ class MemoryService:
         prompt = _OBSERVE_PROMPT_TEMPLATE.format(text=text)
         headers = {"Authorization": f"Bearer {NERON_API_KEY}"} if NERON_API_KEY else {}
         try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
+            async with httpx.AsyncClient(timeout=900.0) as client:
                 response = await client.post(
                     LLM_GENERATE_URL,
                     json={
                         "task_type": "memory",
+                        "json_mode": True,
                         "prompt": prompt,
                         "context": {},
                         "model_preference": "auto",
@@ -177,24 +190,44 @@ class MemoryService:
         raw_text = str(data.get("result") or "").strip()
         logger.info("oblivia_observe_judge_result text=%r", raw_text)
 
-        facts: list[str] = []
-        for line in raw_text.splitlines():
-            line = line.strip()
-            if line.upper().startswith("FAIT:"):
-                fact_text = line.split(":", 1)[1].strip() if ":" in line else ""
-                if fact_text:
-                    facts.append(fact_text)
-        facts = facts[:50]
+        try:
+            bruts = json.loads(raw_text).get("facts", [])
+        except Exception:
+            logger.warning("oblivia_observe_json_invalide", exc_info=True)
+            return
+        if not isinstance(bruts, list):
+            logger.warning("oblivia_observe_facts_non_liste")
+            return
+        bruts = bruts[:50]
 
-        for fact_text in facts:
-            record = MemoryRecord(
-                content=fact_text,
-                source="agent",
-                category="extrait",
-                metadata={"juge": "oblivia_auto_judge", "origin_memory": origin_id},
+        retenus, rejets = normaliser(bruts)
+        for triplet, motif in rejets:
+            logger.info("oblivia_rejet motif=%r triplet=%r", motif, triplet)
+
+        maintenant = datetime.now(timezone.utc).isoformat()
+        cle = origin_id or maintenant
+        for f in retenus:
+            etat = await asyncio.to_thread(
+                self.oblivia.sqlite.add_candidate,
+                f["subject"], f["predicate"], f["object"], cle, 1.0, maintenant,
             )
-            await asyncio.to_thread(self.oblivia.remember, record)
-        logger.info("oblivia_observe_done facts_saved=%d", len(facts))
+            logger.info(
+                "oblivia_candidat %s | %s | %s -> %s point(s)%s",
+                f["subject"], f["predicate"], f["object"], etat["points"],
+                " (deja compte)" if etat["deja_compte"] else "",
+            )
+        promus = await asyncio.to_thread(
+            self.oblivia.sqlite.promote_candidates, 2.0, maintenant
+        )
+        for p in promus:
+            logger.info(
+                "oblivia_promotion %s | %s | %s (%s points)",
+                p["subject"], p["predicate"], p["object"], p["points"],
+            )
+        logger.info(
+            "oblivia_observe_done retenus=%d rejetes=%d promus=%d",
+            len(retenus), len(rejets), len(promus),
+        )
 
 
 def create_memory_service() -> MemoryService:

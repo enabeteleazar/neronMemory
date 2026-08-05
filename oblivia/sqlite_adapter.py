@@ -48,6 +48,24 @@ class SQLiteMemoryAdapter:
                     retracted_at TEXT,
                     retraction_reason TEXT
                 );
+                -- Brouillon : triplets en attente de corroboration.
+                -- Rien n'entre dans knowledge_facts avant d'avoir atteint
+                -- le seuil de points (1 par message, 0.5 par relecture).
+                CREATE TABLE IF NOT EXISTS fact_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    object TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    points REAL NOT NULL DEFAULT 0,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    origin_memories TEXT NOT NULL DEFAULT '[]',
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    promoted_at TEXT,
+                    promoted_fact_id INTEGER,
+                    UNIQUE(subject, predicate, object)
+                );
                 CREATE TABLE IF NOT EXISTS semantic_nodes (
                     id TEXT PRIMARY KEY,
                     type TEXT NOT NULL,
@@ -85,6 +103,84 @@ class SQLiteMemoryAdapter:
                 ),
             )
         return record
+
+    def add_candidate(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        origin_key: str,
+        points: float,
+        timestamp: str,
+    ) -> dict[str, Any]:
+        """Ajoute ou renforce un triplet dans le brouillon.
+
+        Un meme message ne peut JAMAIS compter deux fois : origin_key est
+        conserve dans origin_memories, et rejoue sans aucun effet.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, points, origin_memories FROM fact_candidates "
+                "WHERE subject=? AND predicate=? AND object=?",
+                (subject, predicate, obj),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO fact_candidates (subject, predicate, object, "
+                    "points, message_count, origin_memories, first_seen, last_seen) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (subject, predicate, obj, points, 1,
+                     json.dumps([origin_key]), timestamp, timestamp),
+                )
+                return {"points": points, "deja_compte": False}
+            origines = json.loads(row["origin_memories"])
+            if origin_key in origines:
+                return {"points": row["points"], "deja_compte": True}
+            origines.append(origin_key)
+            total = round(row["points"] + points, 2)
+            conn.execute(
+                "UPDATE fact_candidates SET points=?, message_count=?, "
+                "origin_memories=?, last_seen=? WHERE id=?",
+                (total, len(origines), json.dumps(origines), timestamp, row["id"]),
+            )
+            return {"points": total, "deja_compte": False}
+
+    def promote_candidates(self, seuil: float, timestamp: str) -> list[dict[str, Any]]:
+        """Recopie au carnet de fiches les candidats ayant atteint le seuil.
+
+        Une fiche deja promue (promoted_at renseigne) n est jamais recopiee.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, subject, predicate, object, confidence, points, "
+                "origin_memories FROM fact_candidates "
+                "WHERE points >= ? AND promoted_at IS NULL",
+                (seuil,),
+            ).fetchall()
+
+        promus: list[dict[str, Any]] = []
+        for row in rows:
+            origines = json.loads(row["origin_memories"])
+            self.add_fact(KnowledgeFact(
+                subject=row["subject"],
+                predicate=row["predicate"],
+                object=row["object"],
+                confidence=row["confidence"],
+                origin_memory=origines[0] if origines else None,
+                metadata={"promu_depuis": "brouillon", "origines": origines,
+                          "points": row["points"]},
+                created_at=timestamp,
+            ))
+            fiche = self.current_fact(row["subject"], row["predicate"], row["object"])
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE fact_candidates SET promoted_at=?, promoted_fact_id=? "
+                    "WHERE id=?",
+                    (timestamp, fiche.id if fiche else None, row["id"]),
+                )
+            promus.append({"subject": row["subject"], "predicate": row["predicate"],
+                           "object": row["object"], "points": row["points"]})
+        return promus
 
     def add_fact(self, fact: KnowledgeFact) -> bool:
         if fact.metadata.get("retract"):
