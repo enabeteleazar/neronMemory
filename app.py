@@ -45,6 +45,10 @@ NERON_LLM_URL = os.getenv("NERON_LLM_URL", "http://127.0.1.2:8765")
 LLM_GENERATE_URL = NERON_LLM_URL.rstrip("/").removesuffix("/llm") + "/llm/generate"
 NERON_API_KEY = os.getenv("NERON_API_KEY", "")
 _observe_tasks: set[asyncio.Task] = set()
+_ETAT_RELECTURE: dict[str, Any] = {
+    "en_cours": False, "relus": 0, "total": 0,
+    "demarre": None, "termine": None,
+}
 # Consigne v8, gagnante au banc du 03/08. La liste des predicats est
 # construite depuis VOCABULAIRE : une seule source, jamais deux listes.
 _OBSERVE_PROMPT_TEMPLATE = (
@@ -122,6 +126,7 @@ class RereadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     limit: int = Field(default=5, ge=1, le=50)
+    background: bool = False
 
 
 class ObserveRequest(BaseModel):
@@ -193,12 +198,39 @@ class MemoryService:
         task.add_done_callback(_observe_tasks.discard)
         return {"observed": True, "status": "scheduled", "record_id": brut.id}
 
-    async def reread(self, limit: int = 5) -> dict[str, Any]:
-        """Rejoue l extraction sur d anciens messages bruts.
+    async def reread(self, limit: int = 5, background: bool = False) -> dict[str, Any]:
+        """Rejoue l extraction, en direct ou en tache de fond.
+
+        Le mode tache de fond existe pour l interface : une passe dure environ
+        400 s par message, un bouton ne peut pas attendre. Le timer de nuit,
+        lui, garde le mode bloquant.
+        """
+        if not background:
+            return await self._reread_boucle(limit)
+        if _ETAT_RELECTURE["en_cours"]:
+            return {"lancee": False, "raison": "relecture deja en cours"}
+        task = asyncio.create_task(self._reread_boucle(limit))
+        _observe_tasks.add(task)
+        task.add_done_callback(_observe_tasks.discard)
+        return {"lancee": True, "limit": limit}
+
+    async def _reread_boucle(self, limit: int) -> dict[str, Any]:
+        """Boucle de relecture proprement dite.
 
         Chaque passe vaut 0.5 point et porte une cle distincte (#rN) : sans
         cela add_candidate la prendrait pour un doublon et l ignorerait.
         """
+        _ETAT_RELECTURE.update({
+            "en_cours": True, "relus": 0, "total": limit,
+            "demarre": datetime.now(timezone.utc).isoformat(), "termine": None,
+        })
+        try:
+            return await self._reread_passes(limit)
+        finally:
+            _ETAT_RELECTURE["en_cours"] = False
+            _ETAT_RELECTURE["termine"] = datetime.now(timezone.utc).isoformat()
+
+    async def _reread_passes(self, limit: int) -> dict[str, Any]:
         records = await asyncio.to_thread(
             self.oblivia.sqlite.records_to_reread, limit
         )
@@ -213,6 +245,7 @@ class MemoryService:
                 self.oblivia.sqlite.mark_reread, rec["id"], passe,
                 datetime.now(timezone.utc).isoformat(),
             )
+            _ETAT_RELECTURE["relus"] += 1
         logger.info("oblivia_relecture_terminee relus=%d", len(records))
         return {"relus": len(records)}
 
@@ -432,6 +465,24 @@ async def retract_fact(request: Request, payload: RetractRequest) -> dict[str, A
     return {"retracted": ok}
 
 
+@app.get("/memory/reread/status")
+async def reread_status(request: Request) -> dict[str, Any]:
+    """Etat de la relecture, pour que l interface puisse suivre."""
+    resume = await asyncio.to_thread(
+        _service(request).oblivia.sqlite.reread_summary
+    )
+    return {**_ETAT_RELECTURE, **resume}
+
+
+@app.get("/memory/records/{record_id}")
+async def get_record(request: Request, record_id: str) -> dict[str, Any]:
+    """La phrase d origine d une fiche, sans laquelle on ne peut pas juger."""
+    rec = await asyncio.to_thread(
+        _service(request).oblivia.sqlite.get_record, record_id
+    )
+    return {"found": rec is not None, "record": rec}
+
+
 @app.get("/memory/facts")
 async def list_facts(request: Request, limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
     """Le carnet de fiches : ce que Neron tient pour vrai."""
@@ -452,7 +503,7 @@ async def list_candidates(request: Request, limit: int = Query(default=200, ge=1
 
 @app.post("/memory/reread")
 async def reread(request: Request, payload: RereadRequest) -> dict[str, Any]:
-    return await _service(request).reread(payload.limit)
+    return await _service(request).reread(payload.limit, payload.background)
 
 
 @app.post("/memory/observe")

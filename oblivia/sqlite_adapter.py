@@ -263,6 +263,27 @@ class SQLiteMemoryAdapter:
             for r in rows
         ]
 
+    def reread_summary(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, MAX(done_at) AS dernier FROM reread_log"
+            ).fetchone()
+        return {"passes_total": row["n"], "derniere_passe": row["dernier"]}
+
+    def get_record(self, record_id: str) -> dict[str, Any] | None:
+        """Message brut d origine. Accepte aussi une cle de relecture <id>#rN."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, source, category, content, created_at "
+                "FROM memory_records WHERE id=?",
+                (record_id.split("#", 1)[0],),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"id": row["id"], "source": row["source"],
+                "category": row["category"], "content": row["content"],
+                "created_at": row["created_at"]}
+
     def add_fact(self, fact: KnowledgeFact) -> bool:
         if fact.metadata.get("retract"):
             return self.retract_fact(fact.subject, fact.predicate, fact.object)
