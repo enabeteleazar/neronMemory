@@ -14,6 +14,7 @@ class SQLiteMemoryAdapter:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self._migrate()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -93,6 +94,26 @@ class SQLiteMemoryAdapter:
                 """
             )
 
+    def _migrate(self) -> None:
+        with self._connect() as conn:
+            colonnes = {r[1] for r in conn.execute(
+                "PRAGMA table_info(fact_candidates)"
+            )}
+            if "rejected_at" not in colonnes:
+                conn.execute(
+                    "ALTER TABLE fact_candidates ADD COLUMN rejected_at TEXT"
+                )
+
+    def reject_candidate(self, candidate_id: int, timestamp: str) -> bool:
+        """Ecarte definitivement un candidat : il ne sera jamais promu."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE fact_candidates SET rejected_at=? "
+                "WHERE id=? AND promoted_at IS NULL",
+                (timestamp, candidate_id),
+            )
+            return cur.rowcount > 0
+
     def save_record(self, record: MemoryRecord) -> MemoryRecord:
         with self._connect() as conn:
             conn.execute(
@@ -145,26 +166,32 @@ class SQLiteMemoryAdapter:
             if origin_key in origines:
                 return {"points": row["points"], "deja_compte": True}
             origines.append(origin_key)
+            # Un message relu N fois reste UN message : on compte les
+            # identifiants de base, pas les cles (<id>#r1, <id>#r2...).
+            messages = len({o.split("#", 1)[0] for o in origines})
             total = round(row["points"] + points, 2)
             conn.execute(
                 "UPDATE fact_candidates SET points=?, message_count=?, "
                 "origin_memories=?, last_seen=? WHERE id=?",
-                (total, len(origines), json.dumps(origines), timestamp, row["id"]),
+                (total, messages, json.dumps(origines), timestamp, row["id"]),
             )
             return {"points": total, "deja_compte": False}
 
-    def promote_candidates(self, seuil: float, timestamp: str) -> list[dict[str, Any]]:
+    def promote_candidates(
+        self, seuil: float, timestamp: str, candidate_id: int | None = None
+    ) -> list[dict[str, Any]]:
         """Recopie au carnet de fiches les candidats ayant atteint le seuil.
 
         Une fiche deja promue (promoted_at renseigne) n est jamais recopiee.
         """
+        base = ("SELECT id, subject, predicate, object, confidence, points, "
+                "origin_memories FROM fact_candidates WHERE promoted_at IS NULL ")
+        if candidate_id is None:
+            requete, params = base + "AND rejected_at IS NULL AND points >= ?", (seuil,)
+        else:
+            requete, params = base + "AND id = ?", (candidate_id,)
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT id, subject, predicate, object, confidence, points, "
-                "origin_memories FROM fact_candidates "
-                "WHERE points >= ? AND promoted_at IS NULL",
-                (seuil,),
-            ).fetchall()
+            rows = conn.execute(requete, params).fetchall()
 
         promus: list[dict[str, Any]] = []
         for row in rows:
@@ -212,6 +239,29 @@ class SQLiteMemoryAdapter:
                 "VALUES (?, ?, ?)",
                 (record_id, passe, timestamp),
             )
+
+    def list_candidates(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Contenu du brouillon, les plus corrobores d abord."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, subject, predicate, object, points, message_count, "
+                "origin_memories, first_seen, last_seen, promoted_at "
+                "FROM fact_candidates "
+                "ORDER BY promoted_at IS NOT NULL, points DESC, last_seen DESC "
+                "LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"], "subject": r["subject"], "predicate": r["predicate"],
+                "object": r["object"], "points": r["points"],
+                "message_count": r["message_count"],
+                "origines": json.loads(r["origin_memories"]),
+                "first_seen": r["first_seen"], "last_seen": r["last_seen"],
+                "promoted_at": r["promoted_at"],
+            }
+            for r in rows
+        ]
 
     def add_fact(self, fact: KnowledgeFact) -> bool:
         if fact.metadata.get("retract"):

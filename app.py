@@ -110,6 +110,14 @@ class ForgetRequest(BaseModel):
 SourceProvenance = Literal["utilisateur", "agent", "externe", "systeme", "inconnu"]
 
 
+class RetractRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    subject: str = Field(min_length=1)
+    predicate: str = Field(min_length=1)
+    object: str = Field(min_length=1)
+
+
 class RereadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -392,6 +400,54 @@ async def recall(request: Request, payload: RecallRequest) -> dict[str, Any]:
 @app.post("/memory/forget")
 async def forget(request: Request, payload: ForgetRequest) -> dict[str, Any]:
     return await _service(request).forget(payload.query)
+
+
+@app.post("/memory/candidates/{candidate_id}/reject")
+async def reject_candidate(request: Request, candidate_id: int) -> dict[str, Any]:
+    """Ecarte un candidat du brouillon : il ne sera jamais promu."""
+    ok = await asyncio.to_thread(
+        _service(request).oblivia.sqlite.reject_candidate,
+        candidate_id, datetime.now(timezone.utc).isoformat(),
+    )
+    return {"rejected": ok}
+
+
+@app.post("/memory/candidates/{candidate_id}/promote")
+async def promote_candidate(request: Request, candidate_id: int) -> dict[str, Any]:
+    """Force la promotion d un candidat, quel que soit son score."""
+    promus = await asyncio.to_thread(
+        _service(request).oblivia.sqlite.promote_candidates,
+        0.0, datetime.now(timezone.utc).isoformat(), candidate_id,
+    )
+    return {"promoted": promus}
+
+
+@app.post("/memory/facts/retract")
+async def retract_fact(request: Request, payload: RetractRequest) -> dict[str, Any]:
+    """Retire une fiche fausse du carnet."""
+    ok = await asyncio.to_thread(
+        _service(request).oblivia.sqlite.retract_fact,
+        payload.subject, payload.predicate, payload.object,
+    )
+    return {"retracted": ok}
+
+
+@app.get("/memory/facts")
+async def list_facts(request: Request, limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
+    """Le carnet de fiches : ce que Neron tient pour vrai."""
+    faits = await asyncio.to_thread(
+        _service(request).oblivia.sqlite.list_facts, limit=limit
+    )
+    return {"count": len(faits), "facts": [f.model_dump(mode="json") for f in faits]}
+
+
+@app.get("/memory/candidates")
+async def list_candidates(request: Request, limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
+    """Le brouillon : ce que Neron soupconne, avec son score."""
+    fiches = await asyncio.to_thread(
+        _service(request).oblivia.sqlite.list_candidates, limit
+    )
+    return {"count": len(fiches), "candidates": fiches}
 
 
 @app.post("/memory/reread")
