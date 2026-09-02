@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
+
 from memory.text_utils import normalize_text
+from memory.oblivia.normalisation import ALIAS_UTILISATEUR, SYNONYMES, plat
 
 
 # Le vocabulaire ferme du juge memoire est en francais, le moteur de lecture
@@ -19,6 +22,55 @@ EQUIVALENTS = {
 
 SUJETS_UTILISATEUR = {"user", "utilisateur"}
 
+# Mots qui ne portent aucune information de recherche.
+VIDES = {
+    "qui", "que", "quoi", "quel", "quelle", "quels", "quelles", "ou", "quand",
+    "comment", "combien", "est", "es", "sont", "suis", "ai", "as", "a", "le",
+    "la", "les", "un", "une", "des", "du", "de", "d", "en", "et", "sais", "sait",
+    "tu", "il", "elle", "s", "appelle", "dis", "moi", "c", "ce", "cette",
+}
+
+# Rendu d un triplet en francais : premiere forme quand le sujet est
+# l utilisateur, seconde pour un tiers.
+RENDU = {
+    "a_pour_frere": ("Ton frère s'appelle {o}.", "{s} a pour frère {o}."),
+    "a_pour_soeur": ("Ta sœur s'appelle {o}.", "{s} a pour sœur {o}."),
+    "a_pour_pere": ("Ton père s'appelle {o}.", "{s} a pour père {o}."),
+    "a_pour_mere": ("Ta mère s'appelle {o}.", "{s} a pour mère {o}."),
+    "a_pour_fils": ("Ton fils s'appelle {o}.", "{s} a pour fils {o}."),
+    "a_pour_fille": ("Ta fille s'appelle {o}.", "{s} a pour fille {o}."),
+    "a_pour_conjoint": ("Ton conjoint s'appelle {o}.", "{s} a pour conjoint {o}."),
+    "a_pour_epoux": ("Ton époux s'appelle {o}.", "{s} a pour époux {o}."),
+    "a_pour_epouse": ("Ton épouse s'appelle {o}.", "{s} a pour épouse {o}."),
+    "a_pour_parent": ("Ton parent s'appelle {o}.", "{s} a pour parent {o}."),
+    "a_pour_enfant": ("Ton enfant s'appelle {o}.", "{s} a pour enfant {o}."),
+    "prenom": ("Tu t'appelles {o}.", "{s} s'appelle {o}."),
+    "age": ("Tu as {o}.", "{s} a {o}."),
+    "habite_a": ("Tu habites à {o}.", "{s} habite à {o}."),
+    "travaille_a": ("Tu travailles à {o}.", "{s} travaille à {o}."),
+    "metier": ("Tu es {o}.", "{s} est {o}."),
+    "aime": ("Tu aimes {o}.", "{s} aime {o}."),
+    "n_aime_pas": ("Tu n'aimes pas {o}.", "{s} n'aime pas {o}."),
+    "film_prefere": ("Ton film préféré est {o}.", "Le film préféré de {s} est {o}."),
+    "animal_prefere": ("Ton animal préféré est {o}.", "L'animal préféré de {s} est {o}."),
+    "possede": ("Tu possèdes {o}.", "{s} possède {o}."),
+    "autre": ("{o}.", "{s} : {o}."),
+}
+
+
+def _mots(texte: str) -> list[str]:
+    return [m for m in re.split(r"[^a-z0-9]+", plat(texte)) if m]
+
+
+def _rendre(fait) -> str:
+    vers_utilisateur, vers_tiers = RENDU.get(
+        fait.predicate, ("{s} {p} {o}.", "{s} {p} {o}.")
+    )
+    gabarit = (vers_utilisateur if plat(fait.subject) in SUJETS_UTILISATEUR
+               else vers_tiers)
+    return gabarit.format(s=fait.subject, o=fait.object,
+                          p=fait.predicate.replace("_", " "))
+
 
 def equiv(nom: str) -> set[str]:
     return EQUIVALENTS.get(nom, {nom})
@@ -33,7 +85,56 @@ class SemanticQueryEngine:
         facts = self.adapter.list_facts(include_retracted=False, limit=1000)
         answer = self._answer(q, facts)
         selected = self._selected_facts(q, facts) if answer else []
+        if not answer:
+            # Aucune formulation ecrite a la main ne correspond : on cherche.
+            answer, selected = self._recherche(q, facts)
         return {"answer": answer, "facts": [fact.model_dump(mode="json") for fact in selected[:limit]]}
+
+    def _recherche(self, q: str, facts) -> tuple[str | None, list]:
+        """Repli quand aucune formulation connue ne correspond.
+
+        On confronte les mots de la question au sujet, au predicat et a
+        l objet de chaque fiche. Si rien ne sort, on cherche dans le texte
+        brut des messages : mieux vaut rendre la phrase d origine qu un
+        silence.
+        """
+        mots = [m for m in _mots(q) if m not in VIDES]
+        if not mots:
+            return None, []
+        vise_utilisateur = any(m in ALIAS_UTILISATEUR for m in _mots(q))
+
+        notes: list[tuple[int, object]] = []
+        for f in facts:
+            if f.retracted:
+                continue
+            pred = set(_mots(f.predicate))
+            for mot, cible in SYNONYMES.items():
+                if cible == f.predicate:
+                    pred |= set(_mots(mot))
+            entites = set(_mots(f.subject)) | set(_mots(f.object))
+            note = sum(2 for m in mots if m in pred)
+            note += sum(2 for m in mots if m in entites)
+            if note and vise_utilisateur and plat(f.subject) in SUJETS_UTILISATEUR:
+                note += 1
+            if note:
+                notes.append((note, f))
+
+        if notes:
+            notes.sort(key=lambda n: -n[0])
+            retenus = [f for _, f in notes[:3]]
+            return " ".join(_rendre(f) for f in retenus), [f for _, f in notes]
+
+        try:
+            records = self.adapter.search_records(q, limit=3)
+        except Exception:
+            records = []
+        if records:
+            extraits = " ".join(f"« {r.content} »" for r in records[:2])
+            return (
+                "Je n'ai pas de fiche là-dessus, mais tu m'as dit : "
+                + extraits
+            ), []
+        return None, []
 
     def _selected_facts(self, q: str, facts):
         if "createur" in q:
