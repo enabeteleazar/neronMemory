@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -10,16 +12,64 @@ from memory.text_utils import normalize_text
 
 
 class SQLiteMemoryAdapter:
+    # Attente maximale sur un verrou avant `database is locked`. Le defaut de
+    # sqlite3 est 5 s : trop court des que deux requetes HTTP ecrivent en meme
+    # temps, et l'erreur remonte alors jusqu'a l'appelant.
+    LOCK_TIMEOUT_SECONDS = 30.0
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
         self._migrate()
+        self._create_indexes()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Connexion transactionnelle, FERMEE a la sortie.
+
+        `with sqlite3.connect(...) as conn` gere la transaction (commit ou
+        rollback) mais NE FERME PAS la connexion — piege classique de
+        l'API sqlite3. Les 19 sites d'appel de cette classe s'en remettaient
+        donc au ramasse-miettes pour liberer les descripteurs. Ce
+        gestionnaire de contexte conserve la semantique transactionnelle et
+        ajoute la fermeture.
+
+        WAL : en mode `delete` (defaut), une ecriture bloque toutes les
+        lectures. memory est un service HTTP asynchrone qui peut traiter
+        plusieurs requetes a la fois ; WAL permet aux lectures de continuer
+        pendant une ecriture.
+        """
+        conn = sqlite3.connect(self.path, timeout=self.LOCK_TIMEOUT_SECONDS)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def _create_indexes(self) -> None:
+        """Index sur les colonnes reellement interrogees.
+
+        Sans eux, `EXPLAIN QUERY PLAN` annonce `SCAN memory_records` et
+        `SCAN knowledge_facts` sur chaque recherche : invisible a 300
+        enregistrements, bloquant a 10 000.
+        """
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_records_created_at
+                    ON memory_records(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_facts_subject_predicate
+                    ON knowledge_facts(subject, predicate);
+                CREATE INDEX IF NOT EXISTS idx_facts_current
+                    ON knowledge_facts(is_current);
+                CREATE INDEX IF NOT EXISTS idx_candidates_points
+                    ON fact_candidates(points DESC);
+                """
+            )
 
     def _init_schema(self) -> None:
         with self._connect() as conn:

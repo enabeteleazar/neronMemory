@@ -8,6 +8,13 @@ __pycache__/
 *.db
 *.sqlite
 *.sqlite3
+# Journaux WAL : crees depuis le passage en journal_mode=WAL (04/09/2026).
+# `*.db` ne les couvre pas — ils vivent a cote de la base et ne doivent
+# jamais etre versionnes.
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
 *.bak
 *.bak[0-9]*
 *.bak.*
