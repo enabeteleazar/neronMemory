@@ -5,6 +5,7 @@ from pathlib import Path
 from memory.protocols import StorageProvider
 from memory.semantic_memory import SemanticMemory
 
+from .predicate_discovery import PredicateRegistry
 from .schemas import MemoryQuery, MemoryRecord, MemorySearchResult, MemoryStatus
 from .sqlite_adapter import SQLiteMemoryAdapter
 from memory.text_utils import normalize_text
@@ -24,6 +25,9 @@ class ObliviaMemoryManager:
         self.obsidian_path = Path(obsidian_path or "server/memory/obsidian")
         self.obsidian_path.mkdir(parents=True, exist_ok=True)
         self.semantic = SemanticMemory(self.sqlite)
+        # Vocabulaire vivant : amorce depuis normalisation.py au premier
+        # demarrage, enrichi ensuite par memory lui-meme.
+        self.predicates = PredicateRegistry(self.sqlite)
 
     def remember(self, record: MemoryRecord) -> MemoryRecord:
         facts, added = self.semantic.remember(record)

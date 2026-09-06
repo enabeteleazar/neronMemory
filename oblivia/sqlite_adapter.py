@@ -141,6 +141,23 @@ class SQLiteMemoryAdapter:
                     origin_memory TEXT,
                     timestamp TEXT NOT NULL
                 );
+                -- Vocabulaire des predicats. Le code ne porte plus qu'un
+                -- vocabulaire d'AMORCAGE : ce qui fait autorite a l'execution
+                -- est cette table, que memory enrichit lui-meme quand il
+                -- rencontre un predicat inconnu mais structurellement valide.
+                --   kind    : attribut | relation_symetrique | relation_orientee
+                --             (determine la forme canonique et la detection
+                --              des paires contradictoires)
+                --   origine : amorce | appris
+                CREATE TABLE IF NOT EXISTS predicates (
+                    name TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    origine TEXT NOT NULL,
+                    usages INTEGER NOT NULL DEFAULT 0,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    exemple TEXT
+                );
                 """
             )
 
@@ -524,6 +541,52 @@ class SQLiteMemoryAdapter:
                     conn.execute("DELETE FROM knowledge_facts WHERE id = ?", (row["id"],))
                     count += 1
         return count
+
+    # ── Vocabulaire des predicats ──────────────────────────────────────
+    # memory apprend ses propres predicats : le vocabulaire du code n'est
+    # qu'un point de depart, cette table est ce qui fait autorite ensuite.
+
+    def list_predicates(self) -> dict[str, dict[str, Any]]:
+        """Vocabulaire courant, indexe par nom."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT name, kind, origine, usages, first_seen, last_seen, exemple "
+                "FROM predicates"
+            ).fetchall()
+        return {row["name"]: dict(row) for row in rows}
+
+    def add_predicate(
+        self,
+        name: str,
+        kind: str,
+        origine: str,
+        timestamp: str,
+        exemple: str | None = None,
+    ) -> bool:
+        """Enregistre un predicat. Renvoie False s'il existait deja.
+
+        `INSERT OR IGNORE` plutot qu'un SELECT puis INSERT : deux messages
+        traites en parallele peuvent decouvrir le meme predicat au meme
+        instant, et la contrainte de cle primaire doit trancher, pas nous.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO predicates "
+                "(name, kind, origine, usages, first_seen, last_seen, exemple) "
+                "VALUES (?, ?, ?, 0, ?, ?, ?)",
+                (name, kind, origine, timestamp, timestamp, exemple),
+            )
+            return cur.rowcount > 0
+
+    def touch_predicate(self, name: str, timestamp: str) -> None:
+        """Compte un emploi. Sert a distinguer un predicat vivant d'un
+        predicat apparu une fois puis jamais revu."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE predicates SET usages = usages + 1, last_seen = ? "
+                "WHERE name = ?",
+                (timestamp, name),
+            )
 
     def status(self) -> dict[str, int]:
         with self._connect() as conn:

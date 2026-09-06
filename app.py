@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
@@ -28,7 +29,7 @@ from memory.oblivia import (
     MemoryRecord,
 )
 from memory.oblivia.manager import ObliviaMemoryManager
-from memory.oblivia.normalisation import VOCABULAIRE, normaliser
+from memory.oblivia.normalisation import normaliser
 from memory.protocols import KnowledgeProvider, MemoryProvider
 
 
@@ -49,16 +50,21 @@ _ETAT_RELECTURE: dict[str, Any] = {
     "en_cours": False, "relus": 0, "total": 0,
     "demarre": None, "termine": None,
 }
-# Consigne v8, gagnante au banc du 03/08. La liste des predicats est
-# construite depuis VOCABULAIRE : une seule source, jamais deux listes.
-_OBSERVE_PROMPT_TEMPLATE = (
+# Consigne v8, gagnante au banc du 03/08. La liste des predicats vient du
+# registre (table `predicates`) et non plus d'une constante : une seule
+# source, et elle suit le vocabulaire au fur et a mesure qu'il s'enrichit.
+_OBSERVE_PROMPT_AVANT_LISTE = (
     "Extrais les informations durables de ce message.\n\n"
     "Beaucoup de messages ne contiennent AUCUNE information durable : ils "
     "parlent d une activite ponctuelle, d un projet du soir, d un rendez-vous. "
     "Dans ce cas la bonne reponse est une liste facts VIDE. C est une reponse "
     "correcte et attendue, pas un echec.\n\n"
-    "Le predicat doit OBLIGATOIREMENT etre choisi dans cette liste :\n"
-    + ", ".join(sorted(VOCABULAIRE)) + "\n\n"
+    "Utilise en PRIORITE un predicat de cette liste :\n"
+)
+_OBSERVE_PROMPT_APRES_LISTE = (
+    "\n\nSi aucun ne convient vraiment, tu peux en proposer un autre, en "
+    "minuscules et avec des underscores (exemple : couleur_preferee). "
+    "N en cree un que si la liste ne couvre pas l information.\n\n"
     "Regles :\n"
     "- un objet JSON par information ATOMIQUE : le metier et la ville sont "
     "deux faits distincts\n"
@@ -69,6 +75,20 @@ _OBSERVE_PROMPT_TEMPLATE = (
     "predicate, object.\n\n"
     "Message : {text}"
 )
+
+
+def _observe_prompt(text: str, vocabulaire: Iterable[str]) -> str:
+    """Consigne du juge, construite a CHAQUE appel.
+
+    Le prompt etait une constante calculee a l'import : les predicats
+    appris apres le demarrage n'auraient jamais ete proposes au modele, qui
+    aurait continue de reinventer des formes proches a chaque message.
+    """
+    return (
+        _OBSERVE_PROMPT_AVANT_LISTE
+        + ", ".join(sorted(vocabulaire))
+        + _OBSERVE_PROMPT_APRES_LISTE.format(text=text)
+    )
 
 
 # Voie rapide : un ordre explicite de memorisation vaut corroboration
@@ -258,7 +278,7 @@ class MemoryService:
         origin_suffixe: str = "",
     ) -> None:
         logger.debug("DEBUG_observe_background_started text=%r", text)
-        prompt = _OBSERVE_PROMPT_TEMPLATE.format(text=text)
+        prompt = _observe_prompt(text, self.oblivia.predicates.noms())
         headers = {"Authorization": f"Bearer {NERON_API_KEY}"} if NERON_API_KEY else {}
         try:
             async with httpx.AsyncClient(timeout=900.0) as client:
@@ -293,9 +313,12 @@ class MemoryService:
             return
         bruts = bruts[:50]
 
-        retenus, rejets = normaliser(bruts)
+        connus_avant = self.oblivia.predicates.noms()
+        retenus, rejets = normaliser(bruts, registre=self.oblivia.predicates)
         for triplet, motif in rejets:
             logger.info("oblivia_rejet motif=%r triplet=%r", motif, triplet)
+        for appris in sorted(self.oblivia.predicates.noms() - connus_avant):
+            logger.info("oblivia_predicat_appris predicat=%r", appris)
 
         maintenant = datetime.now(timezone.utc).isoformat()
         cle = (origin_id or maintenant) + origin_suffixe
