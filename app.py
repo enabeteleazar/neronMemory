@@ -29,6 +29,7 @@ from memory.oblivia import (
     MemoryRecord,
 )
 from memory.oblivia.manager import ObliviaMemoryManager
+from memory.oblivia.provenance import LLM_GENERATED
 from memory.oblivia.normalisation import normaliser
 from memory.protocols import KnowledgeProvider, MemoryProvider
 
@@ -101,11 +102,51 @@ _ORDRE_EXPLICITE = re.compile(
 )
 
 
+# Une QUESTION n'affirme rien. Constate le 07/09/2026 : « Reponds en un seul
+# mot : capitale de la France ? » a produit `utilisateur habite_a Paris` et
+# `utilisateur metier ingenieur`, et « Comment s'appelle mon collegue ? » a
+# produit `utilisateur a_pour_enfant collegue`. Le juge, sur un modele 1.7B,
+# voit un mot du vocabulaire et fabrique un triplet.
+#
+# Le garde-fou est deterministe et volontairement large : rien de ce qui est
+# formule comme une question n'alimente la memoire personnelle. On perd de
+# ce fait les rares affirmations glissees dans une interrogative (« Tu te
+# souviens que j'habite a Troyes ? ») — l'utilisateur peut toujours les
+# poser en clair. C'est l'arbitrage assume de cette mission : l'absence
+# d'information vaut mieux qu'une information fausse.
+_INTERROGATIF = re.compile(
+    r"^\s*(qui|que|quoi|quel|quelle|quels|quelles|quand|ou|où|comment|"
+    r"pourquoi|combien|est[- ]ce|as[- ]tu|es[- ]tu|peux[- ]tu|sais[- ]tu|"
+    r"connais[- ]tu|donne|dis|explique|raconte|reponds|réponds)\b",
+    re.IGNORECASE,
+)
+
+
+def est_une_question(texte: str) -> bool:
+    """Ce message demande-t-il quelque chose plutot que d'affirmer ?"""
+    nu = (texte or "").strip()
+    if not nu:
+        return False
+    if nu.endswith("?"):
+        return True
+    return bool(_INTERROGATIF.match(nu))
+
+
+# Vocabulaire ferme de provenance. Toute valeur hors liste est rejetee par
+# l'API : la provenance est posee par le code appelant, jamais deduite.
+SourceProvenance = Literal["utilisateur", "agent", "externe", "systeme", "inconnu"]
+
+
 class RememberRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     content: str = Field(min_length=1)
     category: str = "unknown"
+    # /memory/remember n'est atteinte que lorsque l'utilisateur demande de
+    # retenir quelque chose : le defaut reflete cette semantique. Un appelant
+    # automatique doit poser explicitement une autre source, faute de quoi ce
+    # qu'il ecrit serait credite comme une parole de l'utilisateur.
+    source: SourceProvenance = "utilisateur"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("content")
@@ -129,9 +170,6 @@ class ForgetRequest(BaseModel):
     query: str = Field(min_length=1)
 
 
-# Vocabulaire ferme de provenance. Toute valeur hors liste est rejetee par
-# l'API : la provenance est posee par le code appelant, jamais deduite.
-SourceProvenance = Literal["utilisateur", "agent", "externe", "systeme", "inconnu"]
 
 
 class RetractRequest(BaseModel):
@@ -173,6 +211,7 @@ class MemoryService:
         record = MemoryRecord(
             content=request.content,
             category=request.category,
+            source=request.source,
             metadata=request.metadata,
         )
         result = await asyncio.to_thread(self.oblivia.remember, record)
@@ -211,6 +250,14 @@ class MemoryService:
         explicite = source == "utilisateur" and bool(_ORDRE_EXPLICITE.search(text))
         if explicite:
             logger.info("oblivia_voie_rapide id=%s", brut.id)
+
+        # Le message est conserve tel quel (il l'a ete juste au-dessus), mais
+        # une question ne part pas au juge : elle ne peut rien affirmer sur
+        # l'utilisateur, et la faire analyser ne produit que des inventions.
+        if not explicite and est_une_question(text):
+            logger.info("oblivia_question_non_jugee id=%s", brut.id)
+            return {"observed": True, "status": "question_ignoree",
+                    "record_id": brut.id}
         task = asyncio.create_task(
             self._observe_background(text, brut.id, explicite)
         )
@@ -257,9 +304,19 @@ class MemoryService:
         for rec in records:
             passe = rec["passes"] + 1
             logger.info("oblivia_relecture id=%s passe=%d", rec["id"], passe)
+            # Une relecture n'apporte AUCUNE preuve nouvelle : c'est le
+            # meme message, relu. Elle valait 0.5 point par passe, si bien
+            # qu'une hypothese a 1 point atteignait le seuil de 2.0 en deux
+            # nuits et devenait un fait etabli sans que l'utilisateur ait
+            # jamais rien confirme. Elle vaut desormais 0.
+            #
+            # La relecture reste utile : elle fait remonter des triplets que
+            # le juge avait manques la premiere fois, et elle enrichit la
+            # tracabilite (origin_memories). Elle ne peut simplement plus
+            # transformer le temps en verite.
             await self._observe_background(
                 rec["content"], rec["id"],
-                points_forces=0.5, origin_suffixe=f"#r{passe}",
+                points_forces=0.0, origin_suffixe=f"#r{passe}",
             )
             await asyncio.to_thread(
                 self.oblivia.sqlite.mark_reread, rec["id"], passe,
@@ -322,6 +379,17 @@ class MemoryService:
 
         maintenant = datetime.now(timezone.utc).isoformat()
         cle = (origin_id or maintenant) + origin_suffixe
+        # Ce qui sort d'ici sort TOUJOURS d'un modele de langage, y compris
+        # quand l'utilisateur a dit « Retiens que... ». Son intention de
+        # memoriser est explicite ; les triplets, eux, restent l'interpretation
+        # du juge.
+        #
+        # La confusion coutait cher : « Retiens que mon velo est un Decathlon
+        # Riverside » etait credite `explicit_user`, donc promu sans
+        # corroboration, et le juge en avait tire `habite_a = Riverside`.
+        # L'ecriture certaine d'un ordre explicite revient a /memory/remember,
+        # qui extrait par regles et sans modele.
+        provenance = LLM_GENERATED
         points = (
             points_forces if points_forces is not None
             else (2.0 if explicite else 1.0)
@@ -329,7 +397,8 @@ class MemoryService:
         for f in retenus:
             etat = await asyncio.to_thread(
                 self.oblivia.sqlite.add_candidate,
-                f["subject"], f["predicate"], f["object"], cle, points, maintenant,
+                f["subject"], f["predicate"], f["object"], cle, points,
+                maintenant, provenance,
             )
             logger.info(
                 "oblivia_candidat %s | %s | %s -> %s point(s)%s",

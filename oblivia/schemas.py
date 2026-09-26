@@ -36,6 +36,9 @@ class KnowledgeFact(Dumpable):
     object: str
     confidence: float = 1.0
     origin_memory: str | None = None
+    # D'ou vient cette information, donc ce qu'on est en droit d'en croire
+    # (cf. oblivia/provenance.py). Defaut prudent : inconnu.
+    provenance: str = "unknown"
     metadata: dict[str, Any] = field(default_factory=dict)
     id: int | None = None
     created_at: str = field(default_factory=now_iso)

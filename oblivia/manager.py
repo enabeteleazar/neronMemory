@@ -24,10 +24,13 @@ class ObliviaMemoryManager:
         )
         self.obsidian_path = Path(obsidian_path or "server/memory/obsidian")
         self.obsidian_path.mkdir(parents=True, exist_ok=True)
-        self.semantic = SemanticMemory(self.sqlite)
         # Vocabulaire vivant : amorce depuis normalisation.py au premier
-        # demarrage, enrichi ensuite par memory lui-meme.
+        # demarrage, enrichi ensuite par memory lui-meme. Il est construit
+        # AVANT la memoire semantique, qui s'en sert pour canoniser les
+        # predicats de son extracteur deterministe — une seule et meme
+        # source de vocabulaire pour les deux chaines d'extraction.
         self.predicates = PredicateRegistry(self.sqlite)
+        self.semantic = SemanticMemory(self.sqlite, registre=self.predicates)
 
     def remember(self, record: MemoryRecord) -> MemoryRecord:
         facts, added = self.semantic.remember(record)

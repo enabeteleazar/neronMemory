@@ -1,14 +1,38 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .provenance import (
+    HYPOTHESE,
+    JAMAIS_AUTOMATIQUE,
+    LLM_GENERATED,
+    PREUVE_DIRECTE,
+    USER_CONFIRMED,
+)
+from .provenance import normaliser as normaliser_provenance
+from .provenance import peut_etre_promu
 from .schemas import KnowledgeFact, MemoryRecord, now_iso
 from memory.text_utils import normalize_text
+
+logger = logging.getLogger("memory.oblivia.sqlite")
+
+# Ordre de force des provenances. Sert quand un meme triplet revient par
+# une voie plus sure : l'utilisateur confirme ce que le modele supposait,
+# la fiche doit gagner en credit, jamais en perdre.
+_FORCE = {p: 3 for p in PREUVE_DIRECTE} | {p: 2 for p in HYPOTHESE} | {
+    p: 1 for p in JAMAIS_AUTOMATIQUE
+}
+
+
+def _meilleure_provenance(actuelle: str | None, nouvelle: str | None) -> str:
+    a, b = normaliser_provenance(actuelle), normaliser_provenance(nouvelle)
+    return a if _FORCE.get(a, 0) >= _FORCE.get(b, 0) else b
 
 
 class SQLiteMemoryAdapter:
@@ -162,6 +186,7 @@ class SQLiteMemoryAdapter:
             )
 
     def _migrate(self) -> None:
+        """Migrations additives : aucune donnee existante n'est touchee."""
         with self._connect() as conn:
             colonnes = {r[1] for r in conn.execute(
                 "PRAGMA table_info(fact_candidates)"
@@ -169,6 +194,27 @@ class SQLiteMemoryAdapter:
             if "rejected_at" not in colonnes:
                 conn.execute(
                     "ALTER TABLE fact_candidates ADD COLUMN rejected_at TEXT"
+                )
+            # Provenance : d'ou vient l'information, donc ce qu'on est en
+            # droit d'en croire (cf. oblivia/provenance.py). Un brouillon
+            # sans provenance connue est une hypothese de modele : c'est le
+            # cas le plus defavorable, donc le defaut le plus sur.
+            if "provenance" not in colonnes:
+                conn.execute(
+                    "ALTER TABLE fact_candidates ADD COLUMN provenance TEXT "
+                    "NOT NULL DEFAULT 'llm_generated'"
+                )
+
+            colonnes_faits = {r[1] for r in conn.execute(
+                "PRAGMA table_info(knowledge_facts)"
+            )}
+            if "provenance" not in colonnes_faits:
+                # Les faits anterieurs a cette migration n'ont aucune preuve
+                # rattachable : 'legacy' les rend identifiables sans les
+                # detruire ni leur preter une fiabilite qu'ils n'ont pas.
+                conn.execute(
+                    "ALTER TABLE knowledge_facts ADD COLUMN provenance TEXT "
+                    "NOT NULL DEFAULT 'legacy'"
                 )
 
     def reject_candidate(self, candidate_id: int, timestamp: str) -> bool:
@@ -208,30 +254,46 @@ class SQLiteMemoryAdapter:
         origin_key: str,
         points: float,
         timestamp: str,
+        provenance: str = LLM_GENERATED,
     ) -> dict[str, Any]:
         """Ajoute ou renforce un triplet dans le brouillon.
 
         Un meme message ne peut JAMAIS compter deux fois : origin_key est
         conserve dans origin_memories, et rejoue sans aucun effet.
+
+        `provenance` dit ce qu'on est en droit de croire de ce triplet
+        (cf. oblivia/provenance.py). Quand un triplet deja connu revient
+        avec une provenance plus forte — l'utilisateur confirme ce que le
+        modele avait suppose — la meilleure des deux est conservee.
         """
+        provenance = normaliser_provenance(provenance)
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT id, points, origin_memories FROM fact_candidates "
+                "SELECT id, points, origin_memories, provenance FROM fact_candidates "
                 "WHERE subject=? AND predicate=? AND object=?",
                 (subject, predicate, obj),
             ).fetchone()
             if row is None:
                 conn.execute(
                     "INSERT INTO fact_candidates (subject, predicate, object, "
-                    "points, message_count, origin_memories, first_seen, last_seen) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "points, message_count, origin_memories, first_seen, "
+                    "last_seen, provenance) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (subject, predicate, obj, points, 1,
-                     json.dumps([origin_key]), timestamp, timestamp),
+                     json.dumps([origin_key]), timestamp, timestamp, provenance),
                 )
-                return {"points": points, "deja_compte": False}
+                return {"points": points, "deja_compte": False,
+                        "provenance": provenance}
             origines = json.loads(row["origin_memories"])
+            retenue = _meilleure_provenance(row["provenance"], provenance)
             if origin_key in origines:
-                return {"points": row["points"], "deja_compte": True}
+                if retenue != row["provenance"]:
+                    conn.execute(
+                        "UPDATE fact_candidates SET provenance=? WHERE id=?",
+                        (retenue, row["id"]),
+                    )
+                return {"points": row["points"], "deja_compte": True,
+                        "provenance": retenue}
             origines.append(origin_key)
             # Un message relu N fois reste UN message : on compte les
             # identifiants de base, pas les cles (<id>#r1, <id>#r2...).
@@ -239,10 +301,12 @@ class SQLiteMemoryAdapter:
             total = round(row["points"] + points, 2)
             conn.execute(
                 "UPDATE fact_candidates SET points=?, message_count=?, "
-                "origin_memories=?, last_seen=? WHERE id=?",
-                (total, messages, json.dumps(origines), timestamp, row["id"]),
+                "origin_memories=?, last_seen=?, provenance=? WHERE id=?",
+                (total, messages, json.dumps(origines), timestamp,
+                 retenue, row["id"]),
             )
-            return {"points": total, "deja_compte": False}
+            return {"points": total, "deja_compte": False,
+                    "provenance": retenue}
 
     def promote_candidates(
         self, seuil: float, timestamp: str, candidate_id: int | None = None
@@ -252,16 +316,37 @@ class SQLiteMemoryAdapter:
         Une fiche deja promue (promoted_at renseigne) n est jamais recopiee.
         """
         base = ("SELECT id, subject, predicate, object, confidence, points, "
-                "origin_memories FROM fact_candidates WHERE promoted_at IS NULL ")
+                "message_count, provenance, origin_memories "
+                "FROM fact_candidates WHERE promoted_at IS NULL ")
         if candidate_id is None:
+            # Le filtre par points reste, mais il ne decide plus seul : la
+            # provenance tranche ensuite, candidat par candidat.
             requete, params = base + "AND rejected_at IS NULL AND points >= ?", (seuil,)
         else:
+            # Promotion nominative : l'utilisateur valide une fiche precise
+            # depuis l'interface. C'est une confirmation explicite, elle
+            # court-circuite legitimement l'examen de provenance.
             requete, params = base + "AND id = ?", (candidate_id,)
         with self._connect() as conn:
             rows = conn.execute(requete, params).fetchall()
 
         promus: list[dict[str, Any]] = []
         for row in rows:
+            if candidate_id is None:
+                autorise, motif = peut_etre_promu(
+                    row["provenance"], row["points"],
+                    row["message_count"], seuil,
+                )
+                if not autorise:
+                    logger.info(
+                        "oblivia_promotion_refusee %s | %s | %s -> %s",
+                        row["subject"], row["predicate"], row["object"], motif,
+                    )
+                    continue
+            provenance_promue = (
+                USER_CONFIRMED if candidate_id is not None
+                else normaliser_provenance(row["provenance"])
+            )
             origines = json.loads(row["origin_memories"])
             self.add_fact(KnowledgeFact(
                 subject=row["subject"],
@@ -270,8 +355,10 @@ class SQLiteMemoryAdapter:
                 confidence=row["confidence"],
                 origin_memory=origines[0] if origines else None,
                 metadata={"promu_depuis": "brouillon", "origines": origines,
-                          "points": row["points"]},
+                          "points": row["points"],
+                          "messages_distincts": row["message_count"]},
                 created_at=timestamp,
+                provenance=provenance_promue,
             ))
             fiche = self.current_fact(row["subject"], row["predicate"], row["object"])
             with self._connect() as conn:
@@ -281,7 +368,8 @@ class SQLiteMemoryAdapter:
                     (timestamp, fiche.id if fiche else None, row["id"]),
                 )
             promus.append({"subject": row["subject"], "predicate": row["predicate"],
-                           "object": row["object"], "points": row["points"]})
+                           "object": row["object"], "points": row["points"],
+                           "provenance": provenance_promue})
         return promus
 
     def records_to_reread(self, limit: int) -> list[dict[str, Any]]:
@@ -312,7 +400,7 @@ class SQLiteMemoryAdapter:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT id, subject, predicate, object, points, message_count, "
-                "origin_memories, first_seen, last_seen, promoted_at "
+                "origin_memories, first_seen, last_seen, promoted_at, provenance "
                 "FROM fact_candidates "
                 "ORDER BY promoted_at IS NOT NULL, points DESC, last_seen DESC "
                 "LIMIT ?",
@@ -326,6 +414,7 @@ class SQLiteMemoryAdapter:
                 "origines": json.loads(r["origin_memories"]),
                 "first_seen": r["first_seen"], "last_seen": r["last_seen"],
                 "promoted_at": r["promoted_at"],
+                "provenance": r["provenance"],
             }
             for r in rows
         ]
@@ -354,6 +443,17 @@ class SQLiteMemoryAdapter:
     def add_fact(self, fact: KnowledgeFact) -> bool:
         if fact.metadata.get("retract"):
             return self.retract_fact(fact.subject, fact.predicate, fact.object)
+
+        # Idempotence generale. La deduplication n'existait que pour une
+        # poignee de predicats nommes (lives_at, works_at, likes...) : tout
+        # le reste s'empilait. La base de production comptait ainsi trois
+        # fois `animal_prefere = le renard` et deux fois `film_prefere =
+        # Interstellar`. Reecrire un fait deja connu ne doit rien changer.
+        if not fact.metadata.get("historical"):
+            deja = self.current_fact(fact.subject, fact.predicate, fact.object)
+            if deja is not None and not deja.retracted:
+                return False
+
         if fact.metadata.get("historical"):
             existing = [
                 item for item in self.list_facts(subject=fact.subject, predicate=fact.predicate)
@@ -389,8 +489,8 @@ class SQLiteMemoryAdapter:
                 INSERT INTO knowledge_facts
                 (subject, predicate, object, confidence, origin_memory, metadata,
                  created_at, valid_from, valid_to, is_current, retracted,
-                 retracted_at, retraction_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 retracted_at, retraction_reason, provenance)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._fact_row(fact),
             )
@@ -422,6 +522,7 @@ class SQLiteMemoryAdapter:
             int(fact.retracted),
             fact.retracted_at,
             fact.retraction_reason,
+            normaliser_provenance(fact.provenance),
         )
 
     def _upsert_node(self, conn: sqlite3.Connection, node_id: str, type_: str, label: str, confidence: float, timestamp: str) -> None:
@@ -612,6 +713,8 @@ class SQLiteMemoryAdapter:
             object=row["object"],
             confidence=row["confidence"],
             origin_memory=row["origin_memory"],
+            provenance=(row["provenance"] if "provenance" in row.keys()
+                        else "legacy"),
             metadata=json.loads(row["metadata"] or "{}"),
             created_at=row["created_at"],
             valid_from=row["valid_from"],
