@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from server.common.paths import NERON_SERVER_DIR, service_version
 from server.common.service import create_service_app
+from memory.security import install_api_key_guard
 from memory.knowledge import (
     KnowledgeDocument,
     KnowledgeDocumentMeta,
@@ -483,6 +484,9 @@ app = create_service_app(
     setup=_setup,
     health=_health_details,
 )
+# Toutes les routes exigent Authorization: Bearer <NERON_API_KEY>, sauf
+# /health et /metrics. Voir memory/security.py.
+install_api_key_guard(app)
 
 
 def _service(request: Request) -> MemoryService:
